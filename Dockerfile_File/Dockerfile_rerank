@@ -1,0 +1,24 @@
+FROM python:3.10
+
+WORKDIR /app
+
+# 设置 pip 使用阿里云的镜像源
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+
+# 安装依赖
+RUN pip install flask transformers sentencepiece accelerate torch
+
+# 创建模型目录
+RUN mkdir -p /models/bge-reranker-base
+
+# 直接复制模型到指定路径
+COPY ./models/bge-reranker-base /models/bge-reranker-base
+
+
+# 设置模型路径环境变量
+ENV RERANK_MODEL_PATH=/app/models/bge-reranker-base
+ENV RERANK_BATCH_SIZE=4
+
+EXPOSE 8091
+
+CMD ["python", "app.py"]
