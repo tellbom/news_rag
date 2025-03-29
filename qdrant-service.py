@@ -10,24 +10,113 @@ import threading
 import queue
 from bs4 import BeautifulSoup
 
-# LlamaIndex imports
-from llama_index.core import Settings, Document
-from llama_index.core.node_parser import SentenceSplitter
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.vector_stores.qdrant import QdrantVectorStore
-from llama_index.core.indices.vector_store import VectorStoreIndex
-from llama_index.core.retrievers import VectorIndexRetriever
-
 # Qdrant client
 import qdrant_client
 from qdrant_client.http import models as qdrant_models
 from sentence_transformers import SentenceTransformer
+
+# LlamaIndex imports
+from llama_index.core import Settings, Document
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.indices.vector_store import VectorStoreIndex
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.vector_stores.qdrant import QdrantVectorStore
 
 # Initialize Flask app
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("VectorService")
 
+
+# 创建自己的嵌入适配器
+
+class CustomEmbedding:
+    def __init__(self, model_path, local_files_only=True):
+        """初始化自定义嵌入模型
+
+        Args:
+            model_path: 模型路径
+            local_files_only: 是否仅使用本地模型
+        """
+        self.model = SentenceTransformer(model_path, local_files_only=local_files_only)
+        self.tokenizer = self.model.tokenizer
+        # 设置模型属性，LlamaIndex可能会查询这些
+        self.model_name = model_path
+        self.embed_dim = self.model.get_sentence_embedding_dimension()
+
+    def get_text_embedding(self, text: str) -> List[float]:
+        """获取单个文本的嵌入向量"""
+        return self.model.encode(text, convert_to_tensor=False).tolist()
+
+    def get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """获取多个文本的嵌入向量"""
+        return self.model.encode(texts, convert_to_tensor=False).tolist()
+
+    def get_text_embedding_batch(self, texts: List[str], **kwargs) -> List[List[float]]:
+        """批量获取文本嵌入向量 - LlamaIndex内部调用此方法
+
+        Args:
+            texts: 文本列表
+            **kwargs: 额外参数，包括show_progress等
+
+        Returns:
+            嵌入向量列表
+        """
+        # 忽略额外参数，只传递SentenceTransformer支持的参数
+        show_progress = kwargs.get('show_progress', False)
+        # sentence-transformers支持show_progress
+        return self.model.encode(texts, convert_to_tensor=False, show_progress_bar=show_progress).tolist()
+
+    def embed_documents(self, documents: List[Any], **kwargs) -> List[List[float]]:
+        """将文档对象转换为嵌入向量列表"""
+        if hasattr(documents[0], "text"):
+            # 如果是文档对象有text属性
+            texts = [doc.text for doc in documents]
+        else:
+            # 假设文档对象可以转换为字符串
+            texts = [str(doc) for doc in documents]
+        return self.get_text_embedding_batch(texts, **kwargs)
+
+    def embed_query(self, query: str) -> List[float]:
+        """将查询转换为嵌入向量"""
+        return self.get_text_embedding(query)
+
+    def to_dict(self) -> Dict:
+        """序列化方法，LlamaIndex有时会调用此方法保存模型配置"""
+        return {
+            "model_name": self.model_name,
+            "embed_dim": self.embed_dim,
+            "type": "custom_embedding"
+        }
+
+    def get_agg_embedding_from_queries(self, queries: List[str], **kwargs) -> List[float]:
+        """优化的聚合嵌入方法（归一化后平均）"""
+        embeddings = [self.get_text_embedding(q) for q in queries]
+
+        # 先对每个向量进行L2归一化
+        normalized = []
+        for emb in embeddings:
+            norm = sum(x * x for x in emb) ** 0.5
+            if norm > 0:
+                normalized.append([x / norm for x in emb])
+            else:
+                normalized.append(emb)
+
+        # 然后平均
+        embedding_length = len(normalized[0])
+        agg_embedding = [0.0] * embedding_length
+        for emb in normalized:
+            for i in range(embedding_length):
+                agg_embedding[i] += emb[i]
+
+        for i in range(embedding_length):
+            agg_embedding[i] /= len(normalized)
+
+        # 最后再次归一化
+        norm = sum(x * x for x in agg_embedding) ** 0.5
+        if norm > 0:
+            return [x / norm for x in agg_embedding]
+        return agg_embedding
 
 class AsyncTaskManager:
     """异步任务管理器，使用线程池处理耗时任务"""
@@ -144,9 +233,6 @@ class AsyncTaskManager:
 
         return result
 
-
-
-
 class QdrantLlamaIndexService:
     """使用Qdrant和LlamaIndex的向量存储和检索服务"""
 
@@ -157,9 +243,7 @@ class QdrantLlamaIndexService:
             qdrant_port: int = 6333,
             chunk_size: int = 1000,
             chunk_overlap: int = 200,
-            similarity_top_k: int = 5,
-            mmr_enabled: bool = True,
-            mmr_diversity_bias: float = 0.3
+            similarity_top_k: int = 5
     ):
         """
         初始化向量服务
@@ -171,8 +255,6 @@ class QdrantLlamaIndexService:
             chunk_size: 分块大小
             chunk_overlap: 分块重叠大小
             similarity_top_k: 默认搜索返回结果数
-            mmr_enabled: 是否启用最大边际相关性算法来提高多样性
-            mmr_diversity_bias: MMR多样性偏差参数(0-1)，越高多样性越大
         """
         self.logger = logging.getLogger("QdrantLlamaIndexService")
 
@@ -181,8 +263,6 @@ class QdrantLlamaIndexService:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.similarity_top_k = similarity_top_k
-        self.mmr_enabled = mmr_enabled
-        self.mmr_diversity_bias = mmr_diversity_bias
 
         # 初始化Qdrant客户端
         self.logger.info(f"连接到Qdrant: {qdrant_host}:{qdrant_port}")
@@ -197,15 +277,9 @@ class QdrantLlamaIndexService:
         # 设置LlamaIndex
         self.logger.info(f"加载嵌入模型: {embedding_model_path}")
         try:
-            self.embed_model = SentenceTransformer(
-                model_name_or_path=embedding_model_path,
-                local_files_only=True  # 强制使用本地模型
-            )
+            # 使用LlamaIndex自带的适配器，添加本地模型参数
 
-            # 获取向量维度
-            test_embedding = self.embed_model.get_text_embedding("测试")
-            self.vector_dim = len(test_embedding)
-            self.logger.info(f"嵌入向量维度: {self.vector_dim}")
+            self.embed_model = CustomEmbedding(embedding_model_path)
 
             # 设置LlamaIndex全局配置
             Settings.embed_model = self.embed_model
@@ -431,14 +505,13 @@ class QdrantLlamaIndexService:
 
         return task_id
 
-    def search_news(self, query: str, n_results: int = None, mmr_enabled: bool = None) -> List[Dict]:
+    def search_news(self, query: str, n_results: int = None) -> List[Dict]:
         """
         搜索新闻
 
         Args:
             query: 查询文本
             n_results: 返回结果数量，如果为None则使用默认值
-            mmr_enabled: 是否使用MMR算法，如果为None则使用默认设置
 
         Returns:
             List[Dict]: 搜索结果列表
@@ -446,7 +519,6 @@ class QdrantLlamaIndexService:
         try:
             # 使用指定的参数或默认参数
             top_k = n_results if n_results is not None else self.similarity_top_k
-            use_mmr = mmr_enabled if mmr_enabled is not None else self.mmr_enabled
 
             # 创建检索器
             retriever = VectorIndexRetriever(
@@ -454,19 +526,8 @@ class QdrantLlamaIndexService:
                 similarity_top_k=top_k * 2,  # 获取更多结果用于去重
             )
 
-            # 执行检索，如果启用了MMR，使用MMR算法
-            if use_mmr:
-                from llama_index.core.postprocessor import MMRReranker
-                nodes = retriever.retrieve(query)
 
-                # 应用MMR重排序
-                mmr_reranker = MMRReranker(
-                    diversity_bias=self.mmr_diversity_bias,
-                    fetch_k=len(nodes)
-                )
-                nodes = mmr_reranker.postprocess_nodes(nodes, query_str=query)
-            else:
-                nodes = retriever.retrieve(query)
+            nodes = retriever.retrieve(query)
 
             # 格式化结果
             formatted_results = []
@@ -500,14 +561,13 @@ class QdrantLlamaIndexService:
             self.logger.error(f"搜索新闻时出错: {str(e)}")
             return []
 
-    def search_announcements(self, query: str, n_results: int = None, mmr_enabled: bool = None) -> List[Dict]:
+    def search_announcements(self, query: str, n_results: int = None) -> List[Dict]:
         """
         搜索公告
 
         Args:
             query: 查询文本
             n_results: 返回结果数量，如果为None则使用默认值
-            mmr_enabled: 是否使用MMR算法，如果为None则使用默认设置
 
         Returns:
             List[Dict]: 搜索结果列表
@@ -515,7 +575,7 @@ class QdrantLlamaIndexService:
         try:
             # 使用指定的参数或默认参数
             top_k = n_results if n_results is not None else self.similarity_top_k
-            use_mmr = mmr_enabled if mmr_enabled is not None else self.mmr_enabled
+
 
             # 创建检索器
             retriever = VectorIndexRetriever(
@@ -523,19 +583,8 @@ class QdrantLlamaIndexService:
                 similarity_top_k=top_k * 2,  # 获取更多结果用于去重
             )
 
-            # 执行检索，如果启用了MMR，使用MMR算法
-            if use_mmr:
-                from llama_index.core.postprocessor import MMRReranker
-                nodes = retriever.retrieve(query)
-
-                # 应用MMR重排序
-                mmr_reranker = MMRReranker(
-                    diversity_bias=self.mmr_diversity_bias,
-                    fetch_k=len(nodes)
-                )
-                nodes = mmr_reranker.postprocess_nodes(nodes, query_str=query)
-            else:
-                nodes = retriever.retrieve(query)
+            # 执行检索
+            nodes = retriever.retrieve(query)
 
             # 格式化结果
             formatted_results = []
@@ -570,20 +619,19 @@ class QdrantLlamaIndexService:
             self.logger.error(f"搜索公告时出错: {str(e)}")
             return []
 
-    def search_all(self, query: str, n_results: int = None, mmr_enabled: bool = None) -> Dict[str, List[Dict]]:
+    def search_all(self, query: str, n_results: int = None) -> Dict[str, List[Dict]]:
         """
         同时搜索新闻和公告
 
         Args:
             query: 查询文本
             n_results: 每种类型返回的结果数量
-            mmr_enabled: 是否使用MMR算法
 
         Returns:
             Dict[str, List[Dict]]: 搜索结果字典
         """
-        news_results = self.search_news(query, n_results, mmr_enabled)
-        announcement_results = self.search_announcements(query, n_results, mmr_enabled)
+        news_results = self.search_news(query, n_results)
+        announcement_results = self.search_announcements(query, n_results)
 
         return {
             "news": news_results,
@@ -762,21 +810,17 @@ task_manager = AsyncTaskManager(max_workers=3)
 
 # 从环境变量获取配置
 EMBEDDING_MODEL_PATH = os.environ.get('EMBEDDING_MODEL_PATH', '/models/sentence-transformers_text2vec-large-chinese')
-QDRANT_HOST = os.environ.get('QDRANT_HOST', 'localhost')
+QDRANT_HOST = os.environ.get('QDRANT_HOST', '124.71.225.73')
 QDRANT_PORT = int(os.environ.get('QDRANT_PORT', '6333'))
 CHUNK_SIZE = int(os.environ.get('CHUNK_SIZE', '1000'))
 CHUNK_OVERLAP = int(os.environ.get('CHUNK_OVERLAP', '200'))
 SIMILARITY_TOP_K = int(os.environ.get('SIMILARITY_TOP_K', '5'))
-MMR_ENABLED = os.environ.get('MMR_ENABLED', 'true').lower() == 'true'
 MMR_DIVERSITY_BIAS = float(os.environ.get('MMR_DIVERSITY_BIAS', '0.3'))
 
 # 应用启动时初始化向量服务
 vector_service = None
 
-
-@app.before_first_request
-def initialize_vector_service():
-    global vector_service
+with app.app_context():
     try:
         logger.info("初始化向量服务...")
         vector_service = QdrantLlamaIndexService(
@@ -786,8 +830,6 @@ def initialize_vector_service():
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
             similarity_top_k=SIMILARITY_TOP_K,
-            mmr_enabled=MMR_ENABLED,
-            mmr_diversity_bias=MMR_DIVERSITY_BIAS
         )
         logger.info("向量服务初始化完成")
     except Exception as e:
@@ -808,9 +850,7 @@ def health_check():
             "qdrant_host": QDRANT_HOST,
             "qdrant_port": QDRANT_PORT,
             "chunk_size": CHUNK_SIZE,
-            "chunk_overlap": CHUNK_OVERLAP,
-            "mmr_enabled": MMR_ENABLED,
-            "mmr_diversity_bias": MMR_DIVERSITY_BIAS
+            "chunk_overlap": CHUNK_OVERLAP
         }
     })
 
@@ -828,16 +868,15 @@ def vector_search():
 
     query = data['query']
     n_results = data.get('n_results', None)
-    mmr_enabled = data.get('mmr_enabled', None)
     search_type = data.get('search_type', 'all').lower()
 
     try:
         if search_type == 'news':
-            results = {"news": vector_service.search_news(query, n_results, mmr_enabled), "announcements": []}
+            results = {"news": vector_service.search_news(query, n_results), "announcements": []}
         elif search_type == 'announcements':
-            results = {"news": [], "announcements": vector_service.search_announcements(query, n_results, mmr_enabled)}
+            results = {"news": [], "announcements": vector_service.search_announcements(query, n_results)}
         else:  # 'all' or any other value
-            results = vector_service.search_all(query, n_results, mmr_enabled)
+            results = vector_service.search_all(query, n_results)
 
         return app.response_class(
             response=json.dumps(results, ensure_ascii=False),
@@ -980,5 +1019,4 @@ def delete_announcement(doc_id):
 
 # 启动应用
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5001))
     app.run(host='0.0.0.0', port=port)
