@@ -27,9 +27,110 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("VectorService")
 
+from transformers import AutoTokenizer, AutoModel
+import torch
+import numpy as np
+import re
+
+
+class SemanticChunker:
+    def __init__(self, model_path="/models/chinese-roberta-wwm-ext", threshold=0.6, device="cpu"):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModel.from_pretrained(model_path)
+        self.threshold = threshold
+        self.device = device
+        self.model.to(device)
+        self.model.eval()  # 设置为评估模式以提高效率
+
+    def find_semantic_boundaries(self, text):
+        # 将长文本分成初步段落
+        initial_paragraphs = text.split("\n\n")
+        boundaries = [0]
+        current_position = 0
+
+        for para in initial_paragraphs:
+            # 对段落内的句子计算语义向量
+            sentences = [s.strip() for s in re.split(r'[。！？]', para) if s.strip()]
+
+            if len(sentences) <= 1:
+                current_position += len(para) + 2  # +2 for "\n\n"
+                boundaries.append(current_position)
+                continue
+
+            embeddings = []
+            for sent in sentences:
+                inputs = self.tokenizer(sent, return_tensors="pt",
+                                        truncation=True, max_length=128).to(self.device)
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                # 使用CLS令牌的输出作为句子嵌入
+                embedding = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+                embeddings.append(embedding[0])
+
+            # 计算相邻句子的语义相似度
+            sent_positions = [0]  # 每个句子在段落中的起始位置
+            for i in range(len(sentences) - 1):
+                sent_positions.append(sent_positions[-1] + len(sentences[i]) + 1)  # +1 for punctuation
+
+            for i in range(1, len(sentences)):
+                sim = self._cosine_similarity(embeddings[i - 1], embeddings[i])
+
+                # 根据相似度判断是否为语义边界
+                if sim < self.threshold:
+                    # 添加段落开始位置 + 句子位置
+                    boundaries.append(current_position + sent_positions[i])
+
+            current_position += len(para) + 2  # 更新当前位置
+            boundaries.append(current_position)
+
+        return boundaries[:-1] if len(boundaries) > 1 else boundaries  # 移除最后一个边界
+
+    def _cosine_similarity(self, v1, v2):
+        return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+
+    def chunk_text(self, text, min_chunk_size=200, max_chunk_size=1000):
+        boundaries = self.find_semantic_boundaries(text)
+        chunks = []
+
+        for i in range(len(boundaries) - 1):
+            start = boundaries[i]
+            end = boundaries[i + 1]
+            chunk_text = text[start:end]
+
+            # 避免过小的块
+            if len(chunk_text) >= min_chunk_size or i == len(boundaries) - 2:
+                chunks.append(chunk_text)
+            elif chunks:  # 太小的块合并到前一个
+                chunks[-1] += chunk_text
+            else:  # 第一个就太小
+                chunks.append(chunk_text)
+
+        # 处理过大的块
+        final_chunks = []
+        for chunk in chunks:
+            if len(chunk) <= max_chunk_size:
+                final_chunks.append(chunk)
+            else:
+                # 尝试在句号处分割
+                sentences = re.split(r'([。！？])', chunk)
+                current = ""
+                for i in range(0, len(sentences), 2):
+                    sentence = sentences[i]
+                    punct = sentences[i + 1] if i + 1 < len(sentences) else ""
+                    if len(current) + len(sentence) + len(punct) > max_chunk_size:
+                        if current:
+                            final_chunks.append(current)
+                            current = sentence + punct
+                        else:  # 单个句子超长
+                            final_chunks.append(sentence + punct)
+                    else:
+                        current += sentence + punct
+                if current:
+                    final_chunks.append(current)
+
+        return final_chunks
 
 # 创建自己的嵌入适配器
-
 class CustomEmbedding:
     def __init__(self, model_path, local_files_only=True):
         """初始化自定义嵌入模型
@@ -243,7 +344,8 @@ class QdrantLlamaIndexService:
             qdrant_port: int = 6333,
             chunk_size: int = 1000,
             chunk_overlap: int = 200,
-            similarity_top_k: int = 5
+            similarity_top_k: int = 5,
+            use_semantic_chunking: bool = True  # 控制是否使用语义分块
     ):
         """
         初始化向量服务
@@ -263,6 +365,22 @@ class QdrantLlamaIndexService:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.similarity_top_k = similarity_top_k
+        # 语义分块设置
+        self.use_semantic_chunking = use_semantic_chunking
+        self.semantic_chunker = None
+
+        if self.use_semantic_chunking:
+            try:
+                self.semantic_chunker = SemanticChunker(
+                    model_path="/models/chinese-roberta-wwm-ext",
+                    threshold=0.65
+                )
+                logger.info("语义分块模型加载成功")
+            except Exception as e:
+                logger.error(f"加载语义分块模型失败: {str(e)}")
+                self.use_semantic_chunking = False
+                logger.info("已回退到标准分块方法")
+
 
         # 初始化Qdrant客户端
         self.logger.info(f"连接到Qdrant: {qdrant_host}:{qdrant_port}")
@@ -363,13 +481,13 @@ class QdrantLlamaIndexService:
         Returns:
             str: 任务ID
         """
+        """异步添加新闻"""
         # 生成基础ID
         base_id = id or str(uuid.uuid4())
 
         # 准备要在线程中执行的任务函数
         def process_and_add_task():
             try:
-
                 # 准备元数据
                 metadata = {
                     "title": title,
@@ -385,47 +503,88 @@ class QdrantLlamaIndexService:
                     else:
                         metadata["tags"] = tags
 
-                # 创建LlamaIndex文档
-                documents = [Document(
-                    text=f"{title}\n{content}",
-                    metadata=metadata
-                )]
+                # 使用语义分块或标准分块
+                if self.use_semantic_chunking and self.semantic_chunker:
+                    logger.info(f"使用语义分块处理新闻: {title}")
 
-                # 分割文档
-                nodes = self.splitter.get_nodes_from_documents(documents)
+                    # 使用语义分块器进行分块
+                    full_text = f"{title}\n{content}"
+                    text_chunks = self.semantic_chunker.chunk_text(
+                        full_text,
+                        min_chunk_size=self.chunk_size // 2,
+                        max_chunk_size=self.chunk_size
+                    )
 
-                # 为每个节点设置文档ID和其他元数据
-                for i, node in enumerate(nodes):
-                    node.id_ = f"{base_id}_{i}" if len(nodes) > 1 else base_id
-                    node.metadata["chunk_index"] = i
-                    node.metadata["total_chunks"] = len(nodes)
+                    # 为每个语义块创建Document（非Node！）
+                    documents = []
+                    for i, chunk_text in enumerate(text_chunks):
+                        chunk_metadata = metadata.copy()
+                        chunk_metadata["chunk_index"] = i
+                        chunk_metadata["total_chunks"] = len(text_chunks)
 
-                    # 增强内容 - 为每个块添加标题提示
-                    if not node.text.startswith(title):
-                        node.text = f"{title} - 片段{i + 1}/{len(nodes)}\n\n{node.text}"
+                        # 增强内容 - 为每个块添加标题提示
+                        if not chunk_text.startswith(title):
+                            chunk_text = f"{title} - 片段{i + 1}/{len(text_chunks)}\n\n{chunk_text}"
+
+                        # 创建Document对象，非Node对象
+                        doc = Document(
+                            text=chunk_text,
+                            metadata=chunk_metadata
+                        )
+                        documents.append(doc)
+
+                    # 直接从多个文档创建节点
+                    nodes = self.splitter.get_nodes_from_documents(documents)
+
+                    # 为节点设置ID
+                    for i, node in enumerate(nodes):
+                        node.id_ = str(uuid.uuid4())  # 全新UUID
+                        node.metadata["base_id"] = base_id  # 必须保存原始ID
+                    logger.info(f"使用语义分块将新闻拆分为 {len(nodes)} 个节点")
+                else:
+                    # 使用标准LlamaIndex分块
+                    logger.info(f"使用标准分块处理新闻: {title}")
+                    documents = [Document(
+                        text=f"{title}\n{content}",
+                        metadata=metadata
+                    )]
+
+                    # 使用原有分块器
+                    nodes = self.splitter.get_nodes_from_documents(documents)
+
+                    # 为每个节点设置ID
+                    for i, node in enumerate(nodes):
+                        node.id_ = str(uuid.uuid4())  # 全新UUID
+                        node.metadata["base_id"] = base_id  # 必须保存原始ID
+                        node.metadata["chunk_index"] = i
+                        node.metadata["total_chunks"] = len(nodes)
+
+                        # 增强内容 - 为每个块添加标题提示
+                        if not node.text.startswith(title):
+                            node.text = f"{title} - 片段{i + 1}/{len(nodes)}\n\n{node.text}"
+
+                    logger.info(f"使用标准分块将新闻拆分为 {len(nodes)} 个节点")
 
                 # 添加到向量索引
                 self.news_index.insert_nodes(nodes)
-                self.logger.info(f"成功添加新闻: {title}，分为 {len(nodes)} 个块")
 
                 return {
                     "id": base_id,
                     "chunks": len(nodes),
                     "title": title,
                     "source": source or "未知来源",
-                    "publish_date": publish_date or datetime.now().strftime("%Y-%m-%d")
+                    "publish_date": publish_date or datetime.now().strftime("%Y-%m-%d"),
+                    "chunking_method": "semantic" if self.use_semantic_chunking and self.semantic_chunker else "standard"
                 }
 
             except Exception as e:
-                self.logger.error(f"异步添加新闻时出错: {str(e)}")
+                logger.error(f"异步添加新闻时出错: {str(e)}")
                 raise
-
         # 提交到任务管理器
         task_id = task_manager.submit_task(process_and_add_task)
         self.logger.info(f"提交添加新闻任务: {task_id}, 文档基础ID: {base_id}")
 
         return task_id
-
     def add_announcement_async(self,
                                title: str,
                                content: str,
@@ -434,7 +593,7 @@ class QdrantLlamaIndexService:
                                importance: str = "normal",
                                id: str = None) -> str:
         """
-        异步添加公告
+        异步添加公告，支持语义分块
 
         Args:
             title: 公告标题
@@ -463,24 +622,70 @@ class QdrantLlamaIndexService:
                     "base_id": base_id
                 }
 
-                # 创建LlamaIndex文档
-                documents = [Document(
-                    text=f"{title}\n{content}",
-                    metadata=metadata
-                )]
+                # 判断是否使用语义分块
+                if self.use_semantic_chunking and self.semantic_chunker:
+                    self.logger.info(f"使用语义分块处理公告: {title}")
 
-                # 分割文档
-                nodes = self.splitter.get_nodes_from_documents(documents)
+                    # 使用语义分块器对完整文本进行分块
+                    full_text = f"{title}\n{content}"
+                    text_chunks = self.semantic_chunker.chunk_text(
+                        full_text,
+                        min_chunk_size=self.chunk_size // 2,
+                        max_chunk_size=self.chunk_size
+                    )
 
-                # 为每个节点设置文档ID和其他元数据
-                for i, node in enumerate(nodes):
-                    node.id_ = f"{base_id}_{i}" if len(nodes) > 1 else base_id
-                    node.metadata["chunk_index"] = i
-                    node.metadata["total_chunks"] = len(nodes)
+                    # 为每个语义块创建Document对象
+                    documents = []
+                    for i, chunk_text in enumerate(text_chunks):
+                        chunk_metadata = metadata.copy()
+                        chunk_metadata["chunk_index"] = i
+                        chunk_metadata["total_chunks"] = len(text_chunks)
 
-                    # 增强内容 - 为每个块添加标题提示
-                    if not node.text.startswith(title):
-                        node.text = f"{title} ({importance}) - 片段{i + 1}/{len(nodes)}\n\n{node.text}"
+                        # 增强内容 - 为每个块添加标题和重要性标记
+                        if not chunk_text.startswith(title):
+                            chunk_text = f"{title} ({importance}) - 片段{i + 1}/{len(text_chunks)}\n\n{chunk_text}"
+
+                        # 创建Document对象
+                        doc = Document(
+                            text=chunk_text,
+                            metadata=chunk_metadata
+                        )
+                        documents.append(doc)
+
+                    # 从文档创建节点 - 使用现有分块器
+                    nodes = self.splitter.get_nodes_from_documents(documents)
+
+                    # 为节点设置ID
+                    for i, node in enumerate(nodes):
+                        node.id_ = str(uuid.uuid4())  # 全新UUID
+                        node.metadata["base_id"] = base_id  # 必须保存原始ID
+
+                    self.logger.info(f"使用语义分块将公告拆分为 {len(nodes)} 个块")
+                else:
+                    # 使用标准分块流程
+                    self.logger.info(f"使用标准分块处理公告: {title}")
+
+                    # 创建LlamaIndex文档
+                    documents = [Document(
+                        text=f"{title}\n{content}",
+                        metadata=metadata
+                    )]
+
+                    # 分割文档
+                    nodes = self.splitter.get_nodes_from_documents(documents)
+
+                    # 为每个节点设置文档ID和其他元数据
+                    for i, node in enumerate(nodes):
+                        node.id_ = str(uuid.uuid4())  # 全新UUID
+                        node.metadata["base_id"] = base_id  # 必须保存原始ID
+                        node.metadata["chunk_index"] = i
+                        node.metadata["total_chunks"] = len(nodes)
+
+                        # 增强内容 - 为每个块添加标题提示
+                        if not node.text.startswith(title):
+                            node.text = f"{title} ({importance}) - 片段{i + 1}/{len(nodes)}\n\n{node.text}"
+
+                    self.logger.info(f"使用标准分块将公告拆分为 {len(nodes)} 个块")
 
                 # 添加到向量索引
                 self.notice_index.insert_nodes(nodes)
@@ -492,7 +697,8 @@ class QdrantLlamaIndexService:
                     "title": title,
                     "department": department or "未知部门",
                     "importance": importance,
-                    "publish_date": publish_date or datetime.now().strftime("%Y-%m-%d")
+                    "publish_date": publish_date or datetime.now().strftime("%Y-%m-%d"),
+                    "chunking_method": "semantic" if self.use_semantic_chunking and self.semantic_chunker else "standard"
                 }
 
             except Exception as e:
