@@ -1,0 +1,60 @@
+# 使用官方 Python 镜像作为基础镜像
+FROM python:3.10
+
+# 设置工作目录
+WORKDIR /app
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV SENTENCE_TRANSFORMERS_HOME=/models
+ENV NLTK_DATA=/app/nltk_data
+
+# 安装系统依赖
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置 pip 使用阿里云的镜像源
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 创建模型目录
+RUN mkdir -p ${SENTENCE_TRANSFORMERS_HOME}/sentence-transformers_text2vec-large-chinese
+RUN mkdir -p ${SENTENCE_TRANSFORMERS_HOME}/chinese-roberta-wwm-ext
+
+
+# 安装RAG系统核心组件
+# 分开安装RAG系统核心组件
+RUN pip install cryptography
+RUN pip install sentence-transformers
+
+
+# 安装Web服务和数据处理组件
+RUN pip install pandas tqdm flask matplotlib gunicorn
+
+# 安装依赖并预下载所有必要的 NLTK 数据
+RUN pip install llama-index==0.10.0 qdrant-client==1.9.0 \
+    llama-index-vector-stores-qdrant==0.2.0 && \
+    python -c "import nltk; \
+               nltk.download('punkt', download_dir='${NLTK_DATA}'); \
+               nltk.download('stopwords', download_dir='${NLTK_DATA}'); \
+               print('NLTK data downloaded: punkt, stopwords')"
+
+
+
+# 复制模型到指定路径
+COPY ./text2vec-large-chinese ${SENTENCE_TRANSFORMERS_HOME}/sentence-transformers_text2vec-large-chinese
+COPY ./chinese-roberta-wwm-ext ${SENTENCE_TRANSFORMERS_HOME}/chinese-roberta-wwm-ext
+
+
+# 暴露Flask默认端口
+EXPOSE 5001
+
+# 使用gunicorn作为WSGI服务器运行Flask应用
+# - 3个工作进程
+# - 绑定到所有接口的5001端口
+# - 设置超时时间为120秒
+CMD ["gunicorn", "--workers=3", "--timeout=120", "--bind=0.0.0.0:5001", "app:app"]
