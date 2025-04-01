@@ -34,102 +34,347 @@ import re
 
 
 class SemanticChunker:
-    def __init__(self, model_path="/models/chinese-roberta-wwm-ext", threshold=0.6, device="cpu"):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = AutoModel.from_pretrained(model_path)
-        self.threshold = threshold
-        self.device = device
-        self.model.to(device)
-        self.model.eval()  # 设置为评估模式以提高效率
+    """高级中文语义分块器，使用深度学习模型自适应识别语义边界"""
 
-    def find_semantic_boundaries(self, text):
-        # 将长文本分成初步段落
-        initial_paragraphs = text.split("\n\n")
-        boundaries = [0]
-        current_position = 0
+    def __init__(
+            self,
+            model_path="/models/chinese-roberta-wwm-ext",
+            base_threshold=0.65,
+            min_chunk_chars=150,  # 确保短文本至少作为一个块
+            max_chunk_chars=1500,  # 最大分块尺寸
+            device="cpu",
+            batch_size=8,  # 批处理大小
+            adaptive_threshold=True,  # 自适应阈值
+            debug_mode=False
+    ):
+        """
+        初始化高级语义分块器
 
-        for para in initial_paragraphs:
-            # 对段落内的句子计算语义向量
-            sentences = [s.strip() for s in re.split(r'[。！？]', para) if s.strip()]
+        Args:
+            model_path: 语义模型路径
+            base_threshold: 基础相似度阈值 (0-1)，较低的值会产生更多的分块
+            min_chunk_chars: 最小块字符数
+            max_chunk_chars: 最大块字符数
+            device: 计算设备 ('cpu' 或 'cuda:0' 等)
+            batch_size: 嵌入计算的批处理大小
+            adaptive_threshold: 是否使用自适应阈值
+            debug_mode: 是否启用调试模式
+        """
+        self.min_chunk_chars = min_chunk_chars
+        self.max_chunk_chars = max_chunk_chars
+        self.base_threshold = base_threshold
+        self.adaptive_threshold = adaptive_threshold
+        self.batch_size = batch_size
+        self.debug_mode = debug_mode
+        self.logger = logging.getLogger("SemanticChunker")
 
-            if len(sentences) <= 1:
-                current_position += len(para) + 2  # +2 for "\n\n"
-                boundaries.append(current_position)
-                continue
+        # 加载分词器和模型
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.model = AutoModel.from_pretrained(model_path)
+            self.device = device
+            self.model.to(device)
+            self.model.eval()  # 设置为评估模式
 
-            embeddings = []
-            for sent in sentences:
-                inputs = self.tokenizer(sent, return_tensors="pt",
-                                        truncation=True, max_length=128).to(self.device)
+            # 中文特定分隔符模式
+            self.cn_sentence_pattern = re.compile(r'([。！？\!\?]+|[\n]{2,})')
+            self.cn_subsentence_pattern = re.compile(r'([，；：、,;])')
+
+            # 缓存最近处理的文档向量，提高连续处理性能
+            self.embedding_cache = {}
+            self.cache_size = 100  # 最多缓存100个句子的嵌入
+
+            self.logger.info(f"语义分块器初始化成功: 模型={model_path}, 设备={device}")
+        except Exception as e:
+            self.logger.error(f"初始化语义分块器失败: {str(e)}")
+            raise RuntimeError(f"加载语义模型失败: {str(e)}")
+
+    def _get_sentence_embedding(self, sentences):
+        """批量获取句子嵌入向量"""
+        if not sentences:
+            return []
+
+        # 批处理嵌入计算，降低内存占用
+        embeddings = []
+        for i in range(0, len(sentences), self.batch_size):
+            batch = sentences[i:i + self.batch_size]
+
+            # 检查缓存
+            batch_embeddings = []
+            new_sentences = []
+            new_indices = []
+
+            for j, sentence in enumerate(batch):
+                if sentence in self.embedding_cache:
+                    batch_embeddings.append(self.embedding_cache[sentence])
+                else:
+                    new_sentences.append(sentence)
+                    new_indices.append(j)
+
+            # 处理未缓存的句子
+            if new_sentences:
+                # 确保输入有效
+                valid_sentences = [s if s.strip() else "空" for s in new_sentences]
+
+                # 使用模型获取嵌入
                 with torch.no_grad():
+                    inputs = self.tokenizer(valid_sentences, padding=True, truncation=True,
+                                            return_tensors="pt", max_length=256).to(self.device)
                     outputs = self.model(**inputs)
-                # 使用CLS令牌的输出作为句子嵌入
-                embedding = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-                embeddings.append(embedding[0])
 
-            # 计算相邻句子的语义相似度
-            sent_positions = [0]  # 每个句子在段落中的起始位置
-            for i in range(len(sentences) - 1):
-                sent_positions.append(sent_positions[-1] + len(sentences[i]) + 1)  # +1 for punctuation
+                    # 使用CLS嵌入作为句子表示
+                    new_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
 
-            for i in range(1, len(sentences)):
-                sim = self._cosine_similarity(embeddings[i - 1], embeddings[i])
+                # 更新缓存
+                for k, sentence in enumerate(new_sentences):
+                    embedding = new_embeddings[k]
+                    self.embedding_cache[sentence] = embedding
 
-                # 根据相似度判断是否为语义边界
-                if sim < self.threshold:
-                    # 添加段落开始位置 + 句子位置
-                    boundaries.append(current_position + sent_positions[i])
+                    # 在正确位置插入新嵌入
+                    if k < len(new_indices):
+                        batch_embeddings.insert(new_indices[k], embedding)
 
-            current_position += len(para) + 2  # 更新当前位置
-            boundaries.append(current_position)
+                # 限制缓存大小
+                if len(self.embedding_cache) > self.cache_size:
+                    # 删除最早添加的项
+                    oldest_key = next(iter(self.embedding_cache))
+                    del self.embedding_cache[oldest_key]
 
-        return boundaries[:-1] if len(boundaries) > 1 else boundaries  # 移除最后一个边界
+            embeddings.extend(batch_embeddings)
 
-    def _cosine_similarity(self, v1, v2):
-        return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+        return embeddings
 
-    def chunk_text(self, text, min_chunk_size=200, max_chunk_size=1000):
-        boundaries = self.find_semantic_boundaries(text)
+    def _calculate_similarity(self, emb1, emb2):
+        """计算两个嵌入向量的余弦相似度"""
+        # 长度归一化，避免长度偏差
+        norm1 = np.linalg.norm(emb1)
+        norm2 = np.linalg.norm(emb2)
+        if norm1 > 0 and norm2 > 0:
+            return np.dot(emb1, emb2) / (norm1 * norm2)
+        return 0.0
+
+    def _compute_adaptive_threshold(self, similarities):
+        """动态计算最优阈值"""
+        if not similarities or len(similarities) < 3:
+            return self.base_threshold
+
+        # 使用四分位范围法检测异常点
+        q1 = np.percentile(similarities, 25)
+        q3 = np.percentile(similarities, 75)
+        iqr = q3 - q1
+
+        # 调整阈值以捕获显著的语义变化
+        lower_bound = q1 - 1.5 * iqr
+        threshold = max(lower_bound, self.base_threshold * 0.8)
+        return min(threshold, self.base_threshold * 1.2)  # 限制范围
+
+    def chunk_text(self, text, min_chunk_size=None, max_chunk_size=None):
+        """
+        核心方法：将文本分割成语义连贯的块
+
+        Args:
+            text: 要分割的文本
+            min_chunk_size: 可选，最小块大小，覆盖初始化值
+            max_chunk_size: 可选，最大块大小，覆盖初始化值
+
+        Returns:
+            List[str]: 分割后的文本块列表
+        """
+        if not text:
+            return []
+
+        # 使用传入的参数或默认值
+        min_size = min_chunk_size if min_chunk_size is not None else self.min_chunk_chars
+        max_size = max_chunk_size if max_chunk_size is not None else self.max_chunk_chars
+
+        # 短文本直接作为一个块返回
+        if len(text) < min_size:
+            return [text]
+
+        try:
+            # 阶段1: 按段落进行初步分割
+            paragraphs = self._split_into_paragraphs(text)
+
+            # 阶段2: 对每个段落进行语义边界检测
+            chunks = []
+            current_chunk = ""
+
+            for para in paragraphs:
+                # 如果段落很短，直接添加到当前块
+                if len(para) < min_size // 3:  # 非常短的段落
+                    if current_chunk and len(current_chunk) + len(para) + 2 <= max_size:
+                        current_chunk += "\n\n" + para
+                    else:
+                        if current_chunk:
+                            chunks.append(current_chunk)
+                        current_chunk = para
+                    continue
+
+                # 对较长段落进行句子级分析
+                para_chunks = self._find_semantic_boundaries_in_paragraph(para)
+
+                for chunk in para_chunks:
+                    if not current_chunk:
+                        current_chunk = chunk
+                    elif len(current_chunk) + len(chunk) + 2 <= max_size:
+                        current_chunk += "\n\n" + chunk
+                    else:
+                        chunks.append(current_chunk)
+                        current_chunk = chunk
+
+            # 添加最后一个块
+            if current_chunk:
+                chunks.append(current_chunk)
+
+            # 阶段3: 处理过大的块
+            final_chunks = []
+            for chunk in chunks:
+                if len(chunk) <= max_size:
+                    final_chunks.append(chunk)
+                else:
+                    # 对过大块进行后处理拆分
+                    sub_chunks = self._split_oversized_chunk(chunk, max_size)
+                    final_chunks.extend(sub_chunks)
+
+            # 确保至少返回一个块
+            if not final_chunks:
+                return [text]
+
+            if self.debug_mode:
+                self.logger.info(f"原始长度: {len(text)}, 分块数: {len(final_chunks)}")
+                for i, chunk in enumerate(final_chunks):
+                    self.logger.info(f"块 {i + 1}/{len(final_chunks)}: {len(chunk)} 字符")
+
+            return final_chunks
+
+        except Exception as e:
+            self.logger.error(f"分块过程中出错: {str(e)}")
+            # 出错时，确保至少返回原始文本作为一个块
+            return [text]
+
+    def _split_into_paragraphs(self, text):
+        """将文本拆分为段落"""
+        # 按照多种可能的段落分隔符拆分
+        raw_paragraphs = re.split(r'(\n\s*\n|\r\n\s*\r\n)', text)
+
+        # 重新组合段落和分隔符
+        paragraphs = []
+        for i in range(0, len(raw_paragraphs), 2):
+            para = raw_paragraphs[i]
+            if para.strip():
+                paragraphs.append(para.strip())
+
+        # 如果没有检测到段落，将整个文本作为一个段落
+        if not paragraphs:
+            paragraphs = [text]
+
+        return paragraphs
+
+    def _find_semantic_boundaries_in_paragraph(self, paragraph):
+        """在段落中检测语义边界"""
+        # 分割成句子 (中文特定)
+        sentences = []
+        parts = self.cn_sentence_pattern.split(paragraph)
+
+        for i in range(0, len(parts) - 1, 2):
+            if i < len(parts):
+                sentence = parts[i] + (parts[i + 1] if i + 1 < len(parts) else "")
+                if sentence.strip():
+                    sentences.append(sentence.strip())
+
+        # 如果只有一个或没有句子，返回整个段落
+        if len(sentences) <= 1:
+            return [paragraph]
+
+        # 获取句子嵌入
+        embeddings = self._get_sentence_embedding(sentences)
+
+        if len(embeddings) <= 1:
+            return [paragraph]
+
+        # 计算相邻句子的相似度
+        similarities = []
+        for i in range(len(embeddings) - 1):
+            sim = self._calculate_similarity(embeddings[i], embeddings[i + 1])
+            similarities.append(sim)
+
+        # 计算自适应阈值
+        threshold = self._compute_adaptive_threshold(similarities) if self.adaptive_threshold else self.base_threshold
+
+        # 识别边界
+        boundaries = [0]  # 起始点
+        for i, sim in enumerate(similarities):
+            if sim < threshold:
+                boundaries.append(i + 1)
+
+        # 添加结束边界
+        boundaries.append(len(sentences))
+
+        # 根据边界生成块
         chunks = []
-
         for i in range(len(boundaries) - 1):
             start = boundaries[i]
             end = boundaries[i + 1]
-            chunk_text = text[start:end]
+            chunk = " ".join(sentences[start:end])
+            chunks.append(chunk)
 
-            # 避免过小的块
-            if len(chunk_text) >= min_chunk_size or i == len(boundaries) - 2:
-                chunks.append(chunk_text)
-            elif chunks:  # 太小的块合并到前一个
-                chunks[-1] += chunk_text
-            else:  # 第一个就太小
-                chunks.append(chunk_text)
+        return chunks
 
-        # 处理过大的块
-        final_chunks = []
-        for chunk in chunks:
-            if len(chunk) <= max_chunk_size:
-                final_chunks.append(chunk)
+    def _split_oversized_chunk(self, chunk, max_size):
+        """处理超过最大大小的块"""
+        # 首先尝试在句子边界分割
+        sentences = self.cn_sentence_pattern.split(chunk)
+        if not sentences:
+            return [chunk]  # 无法分割
+
+        # 重组句子并检查大小
+        sub_chunks = []
+        current = ""
+        for i in range(0, len(sentences) - 1, 2):
+            if i < len(sentences):
+                sentence = sentences[i] + (sentences[i + 1] if i + 1 < len(sentences) else "")
+
+                if not current:
+                    current = sentence
+                elif len(current) + len(sentence) <= max_size:
+                    current += sentence
+                else:
+                    sub_chunks.append(current)
+                    current = sentence
+
+        if current:
+            sub_chunks.append(current)
+
+        # 如果存在极长句子，可能需要进一步分割
+        final_sub_chunks = []
+        for sub in sub_chunks:
+            if len(sub) <= max_size:
+                final_sub_chunks.append(sub)
             else:
-                # 尝试在句号处分割
-                sentences = re.split(r'([。！？])', chunk)
+                # 以子句分隔符进一步分割
+                parts = self.cn_subsentence_pattern.split(sub)
                 current = ""
-                for i in range(0, len(sentences), 2):
-                    sentence = sentences[i]
-                    punct = sentences[i + 1] if i + 1 < len(sentences) else ""
-                    if len(current) + len(sentence) + len(punct) > max_chunk_size:
-                        if current:
-                            final_chunks.append(current)
-                            current = sentence + punct
-                        else:  # 单个句子超长
-                            final_chunks.append(sentence + punct)
-                    else:
-                        current += sentence + punct
+                for i in range(0, len(parts) - 1, 2):
+                    if i < len(parts):
+                        part = parts[i] + (parts[i + 1] if i + 1 < len(parts) else "")
+
+                        if not current:
+                            current = part
+                        elif len(current) + len(part) <= max_size:
+                            current += part
+                        else:
+                            final_sub_chunks.append(current)
+                            current = part
+
                 if current:
-                    final_chunks.append(current)
+                    final_sub_chunks.append(current)
 
-        return final_chunks
+        # 如果所有方法都失败，强制截断
+        if not final_sub_chunks:
+            # 每max_size字符强制截断
+            return [chunk[i:i + max_size] for i in range(0, len(chunk), max_size)]
 
+        return final_sub_chunks
 # 创建自己的嵌入适配器
 class CustomEmbedding:
     def __init__(self, model_path, local_files_only=True):
@@ -373,7 +618,10 @@ class QdrantLlamaIndexService:
             try:
                 self.semantic_chunker = SemanticChunker(
                     model_path="/models/chinese-roberta-wwm-ext",
-                    threshold=0.65
+                    base_threshold=0.65,  # 可调整的基础阈值
+                    min_chunk_chars=150,  # 确保短文本也能被处理
+                    max_chunk_chars=1500,  # 最大块大小
+                    adaptive_threshold=True
                 )
                 logger.info("语义分块模型加载成功")
             except Exception as e:
