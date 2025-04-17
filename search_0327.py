@@ -54,6 +54,7 @@ class VectorServiceClient:
         Returns:
             bool: 服务是否可用
         """
+        logger = logging.getLogger("VectorServiceClient")
         try:
             response = requests.get(f"{self.base_url}/health", timeout=5)
             return response.status_code == 200 and response.json().get("status") == "healthy"
@@ -1706,7 +1707,7 @@ class ChineseRAGSystem:
 
 # 初始化RAG系统
 # 从环境变量获取配置
-VECTOR_SERVICE_URL = os.environ.get('VECTOR_SERVICE_URL', 'http://localhost:5001')
+VECTOR_SERVICE_URL = os.environ.get('VECTOR_SERVICE_URL', 'http://192.168.140.100:5001')
 LLM_API_KEY = os.environ.get('LLM_API_KEY', 'sk-9f8124e18aa242af830c8a502c015c40')
 LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
 LLM_MODEL = os.environ.get('LLM_MODEL', 'qwen-plus')
@@ -1715,8 +1716,8 @@ USE_LANGCHAIN = os.environ.get('USE_LANGCHAIN', 'true').lower() == 'true'
 CHUNK_SIZE = int(os.environ.get('CHUNK_SIZE', '1000'))
 CHUNK_OVERLAP = int(os.environ.get('CHUNK_OVERLAP', '200'))
 USE_HYBRID_SEARCH = os.environ.get('use_hybrid_search', 'true').lower() == 'true'
-ES_SERVICE_URL = os.environ.get('es_service_url', 'http://192.168.222.128:8085')
-RERANK_SERVICE_URL = os.environ.get('rerank_service_url', 'http://192.168.222.128:8091')
+ES_SERVICE_URL = os.environ.get('es_service_url', 'http://192.168.140.100:8085')
+RERANK_SERVICE_URL = os.environ.get('rerank_service_url', 'http://192.168.140.100:8091')
 
 if CHROMA_PORT and CHROMA_PORT.isdigit():
     CHROMA_PORT = int(CHROMA_PORT)
@@ -2155,7 +2156,6 @@ def extract_context_endpoint():
         ----上下文信息结束----
 
         基于上述上下文信息，请回答用户的问题。如果上下文信息不足以回答用户问题，请明确指出。"""
-
         # 返回提示词和上下文
         return jsonify({
             "success": True,
