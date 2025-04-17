@@ -502,13 +502,14 @@ class ESServiceClient:
 
 # RankFusion类算法类
 class RankFusion:
-    """结果融合算法工具类，用于融合向量和BM25搜索结果"""
+    """结果融合算法工具类，用于融合向量、BM25和重排序结果"""
 
     @staticmethod
     def contextual_fusion(query: str, dense_results: dict, lexical_results: dict, k: int = 60,
-                          rerank_url: str = None) -> dict:
+                          rerank_url: str = None, rerank_weight: float = 0.4,
+                          vector_weight: float = None, lexical_weight: float = None) -> dict:
         """
-        上下文感知的融合算法，针对不同类型的查询动态调整权重
+        上下文感知的融合算法，针对不同类型的查询动态调整权重，并整合重排序结果
 
         Args:
             query: 用户查询
@@ -516,6 +517,9 @@ class RankFusion:
             lexical_results: 文本检索结果 (格式: {"news": [...], "announcements": [...]})
             k: RRF常数
             rerank_url: 重排序服务URL，如果提供则使用重排序服务
+            rerank_weight: 重排序结果的权重，范围0-1
+            vector_weight: 向量搜索权重(可选)，如果提供则覆盖自动计算的权重
+            lexical_weight: 文本搜索权重(可选)，如果提供则覆盖自动计算的权重
 
         Returns:
             融合后的结果字典 (格式: {"news": [...], "announcements": [...]})
@@ -523,74 +527,8 @@ class RankFusion:
         # 用于保存融合结果
         fused_results = {"news": [], "announcements": []}
 
-        # 处理新闻和公告
-        for content_type in ["news", "announcements"]:
-            # 获取各自的结果
-            vector_content = dense_results.get(content_type, [])
-            lexical_content = lexical_results.get(content_type, [])
-
-            # 合并结果
-            combined_results = []
-            seen_ids = set()
-
-            # 首先添加向量结果
-            for item in vector_content:
-                item_id = item.get("id", "")
-                if item_id and item_id not in seen_ids:
-                    seen_ids.add(item_id)
-                    # 确保源类型标记正确
-                    item["source_type"] = item.get("source_type", "vector")
-                    combined_results.append(item)
-
-            # 然后添加BM25结果
-            for item in lexical_content:
-                item_id = item.get("id", "")
-                if item_id and item_id not in seen_ids:
-                    seen_ids.add(item_id)
-                    # 确保源类型标记正确
-                    item["source_type"] = item.get("source_type", "lexical")
-                    combined_results.append(item)
-
-            # 如果提供了重排序服务URL，使用重排序
-            if rerank_url and combined_results:
-                try:
-                    # 复制一份结果，以便在重排序失败时回退
-                    backup_results = combined_results.copy()
-
-                    # 标准化结果格式，确保内容字段一致
-                    normalized_results = []
-                    for item in combined_results:
-                        normalized_item = item.copy()
-                        # 确保每个项目都有content字段
-                        if "content" not in normalized_item:
-                            normalized_item["content"] = normalized_item.get("text", "")
-                        normalized_results.append(normalized_item)
-
-                    # 调用重排序服务
-                    response = requests.post(
-                        rerank_url + "/rerank",
-                        json={
-                            "query": query,
-                            "documents": normalized_results,
-                            "top_k": len(normalized_results)  # 保留所有结果
-                        },
-                        timeout=10
-                    )
-
-                    if response.status_code == 200:
-                        # 使用重排序结果
-                        reranked = response.json().get("results", [])
-                        if reranked:
-                            fused_results[content_type] = reranked
-                            continue  # 跳过后续处理
-                    else:
-                        app.logger.warning(f"重排序服务返回非200状态码: {response.status_code}")
-                except Exception as e:
-                    app.logger.error(f"调用重排序服务失败: {str(e)}")
-                    # 回退到原始结果
-                    combined_results = backup_results
-
-            # 如果没有使用重排序或重排序失败，使用原始融合方法
+        # 如果没有提供外部权重，则分析查询特征确定权重
+        if vector_weight is None or lexical_weight is None:
             # 提取查询特征
             query_terms = set(query.lower().split())
             is_status_query = any(term in query_terms for term in ['状态', '取消', '完成', '支付'])
@@ -599,26 +537,111 @@ class RankFusion:
 
             # 动态调整权重
             if is_status_query or is_type_query:
-                vector_weight = 0.4
-                lexical_weight = 0.6
+                v_weight = 0.4
+                l_weight = 0.6
             elif is_time_query:
-                vector_weight = 0.5
-                lexical_weight = 0.5
+                v_weight = 0.5
+                l_weight = 0.5
             else:
-                vector_weight = 0.7
-                lexical_weight = 0.3
+                v_weight = 0.7
+                l_weight = 0.3
 
-            # 计算融合分数
-            scores = {}
+            # 使用计算得到的权重
+            vector_weight = vector_weight if vector_weight is not None else v_weight
+            lexical_weight = lexical_weight if lexical_weight is not None else l_weight
 
-            # 处理向量结果
-            for rank, item in enumerate(vector_content, start=1):
+        # 记录使用的权重（可用于调试）
+        app.logger.info(f"融合使用权重: vector={vector_weight}, lexical={lexical_weight}")
+
+        # 处理新闻和公告
+        for content_type in ["news", "announcements"]:
+            # 获取各自的结果
+            vector_content = dense_results.get(content_type, [])
+            lexical_content = lexical_results.get(content_type, [])
+
+            # 合并结果，建立完整的文档集合
+            all_items = {}  # id -> item
+            rerank_candidates = []  # 用于提交给重排序
+
+            # 收集向量结果
+            for item in vector_content:
                 item_id = item.get("id", "")
                 if not item_id:
                     continue
 
-                if item_id not in scores:
-                    scores[item_id] = {"item": item, "score": 0, "matches": set()}
+                # 确保源类型标记正确
+                item["source_type"] = item.get("source_type", "vector")
+                all_items[item_id] = item
+
+                # 添加到重排序候选集
+                if "content" not in item and "text" in item:
+                    item_copy = item.copy()
+                    item_copy["content"] = item_copy.get("text", "")
+                    rerank_candidates.append(item_copy)
+                else:
+                    rerank_candidates.append(item.copy())
+
+            # 收集BM25结果
+            for item in lexical_content:
+                item_id = item.get("id", "")
+                if not item_id:
+                    continue
+
+                # 确保源类型标记正确
+                item["source_type"] = item.get("source_type", "lexical")
+
+                if item_id not in all_items:
+                    all_items[item_id] = item
+                    # 添加到重排序候选集
+                    if "content" not in item and "text" in item:
+                        item_copy = item.copy()
+                        item_copy["content"] = item_copy.get("text", "")
+                        rerank_candidates.append(item_copy)
+                    else:
+                        rerank_candidates.append(item.copy())
+
+            # 初始化分数字典
+            scores = {item_id: {"item": item, "score": 0.0, "matches": set()}
+                      for item_id, item in all_items.items()}
+
+            # 重排序处理 - 获取重排序分数但不直接使用结果
+            rerank_scores = {}  # id -> score
+            if rerank_url and rerank_candidates:
+                try:
+                    # 调用重排序服务
+                    response = requests.post(
+                        rerank_url + "/rerank",
+                        json={
+                            "query": query,
+                            "documents": rerank_candidates,
+                            "top_k": len(rerank_candidates)  # 保留所有结果
+                        },
+                        timeout=10
+                    )
+
+                    if response.status_code == 200:
+                        # 提取重排序分数
+                        reranked = response.json().get("results", [])
+
+                        # 计算归一化的重排序分数 (倒数排名)
+                        for rank, item in enumerate(reranked, start=1):
+                            item_id = item.get("id", "")
+                            if item_id:
+                                # 使用RRF公式计算重排序分数
+                                rerank_scores[item_id] = 1.0 / (k + rank)
+
+                                # 如果有相关性分数，也考虑进去
+                                if "score" in item:
+                                    rerank_scores[item_id] *= (1 + 0.2 * item["score"])
+                except Exception as e:
+                    app.logger.error(f"调用重排序服务失败: {str(e)}")
+                    # 失败时rerank_scores保持为空
+
+            # 计算向量检索分数
+            for rank, item in enumerate(vector_content, start=1):
+                item_id = item.get("id", "")
+                if not item_id or item_id not in scores:
+                    continue
 
                 # 获取相关性分数 - 兼容不同格式
                 relevance_score = item.get("relevance_score", 0.0)
@@ -627,19 +650,17 @@ class RankFusion:
                 scores[item_id]["score"] += vector_weight * (1.0 / (k + rank)) * (1 + 0.2 * relevance_score)
                 scores[item_id]["matches"].add("vector")
 
-            # 处理BM25结果
+            # 计算BM25检索分数
             for rank, item in enumerate(lexical_content, start=1):
                 item_id = item.get("id", "")
-                if not item_id:
+                if not item_id or item_id not in scores:
                     continue
 
-                if item_id not in scores:
-                    scores[item_id] = {"item": item, "score": 0, "matches": set()}
-
+                # 基础RRF分数
                 scores[item_id]["score"] += lexical_weight * (1.0 / (k + rank))
                 scores[item_id]["matches"].add("lexical")
 
-                # 额外的上下文奖励
+                # 额外的词匹配奖励
                 content = item.get("content", "")
                 title = item.get("title", "")
 
@@ -650,14 +671,37 @@ class RankFusion:
                 # 词匹配奖励
                 scores[item_id]["score"] *= (1 + 0.2 * term_match_ratio)
 
+            # 整合重排序分数
+            if rerank_scores:
+                for item_id in scores:
+                    if item_id in rerank_scores:
+                        # 使用配置的权重添加重排序分数
+                        scores[item_id]["score"] += rerank_weight * rerank_scores[item_id]
+                        scores[item_id]["matches"].add("rerank")
+
             # 多检索源奖励
             for item_id, data in scores.items():
-                if len(data["matches"]) > 1:  # 同时出现在两种检索中
+                # 计算匹配源的数量
+                match_count = len(data["matches"])
+
+                # 根据匹配源数量给予不同程度的奖励
+                if match_count == 3:  # 同时在向量、BM25和重排序中出现
+                    data["score"] *= 1.4
+                elif match_count == 2:  # 在两种检索中出现
                     data["score"] *= 1.25
 
             # 按分数排序
             sorted_items = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
+
+            # 提取排序后的结果项
             fused_results[content_type] = [item_data["item"] for item_data in sorted_items]
+
+            # 添加调试信息（可选）
+            for i, item in enumerate(fused_results[content_type]):
+                item_id = item.get("id", "")
+                if item_id in scores:
+                    item["fusion_score"] = scores[item_id]["score"]
+                    item["fusion_sources"] = list(scores[item_id]["matches"])
 
         return fused_results
 
@@ -1586,13 +1630,16 @@ class ChineseRAGSystem:
         # 调用向量服务客户端
         return self.vector_client.search_vector(query, n_results, search_type)
 
-    def hybrid_search_all(self, query: str, n_results: int = 5) -> Dict[str, List[Dict]]:
+    def hybrid_search_all(self, query: str, n_results: int = 5, vector_weight: float = None,
+                          lexical_weight: float = None) -> Dict[str, List[Dict]]:
         """
         混合搜索：使用向量检索和BM25融合搜索结果
 
         Args:
             query: 查询文本
             n_results: 每种类型返回的结果数量
+            vector_weight: 向量搜索权重(可选)，如果提供则覆盖默认值
+            lexical_weight: 文本搜索权重(可选)，如果提供则覆盖默认值
 
         Returns:
             Dict[str, List[Dict]]: 融合后的搜索结果
@@ -1609,12 +1656,14 @@ class ChineseRAGSystem:
                 # 获取重排序服务URL
                 rerank_url = RERANK_SERVICE_URL if 'RERANK_SERVICE_URL' in globals() else None
 
-                # 使用融合方法
+                # 使用融合方法，传入权重配置
                 fused_results = RankFusion.contextual_fusion(
                     query=query,
                     dense_results=vector_results,
                     lexical_results=bm25_results,
-                    rerank_url=rerank_url
+                    rerank_url=rerank_url,
+                    vector_weight=vector_weight,
+                    lexical_weight=lexical_weight
                 )
 
                 app.logger.info(f"使用{'重排序增强的' if rerank_url else ''}混合搜索结果")
@@ -2008,6 +2057,171 @@ def es_status_endpoint():
             "hybrid_search_enabled": rag_system.use_hybrid_search
         })
 
+
+#专门用于获取提示词和检索内容
+@app.route('/extract_context', methods=['POST'])
+def extract_context_endpoint():
+    """提取上下文和生成提示词接口，不调用LLM"""
+    if not rag_system:
+        return jsonify({"error": "RAG系统尚未初始化"}), 500
+
+    data = request.json
+    if not data or 'query' not in data:
+        return jsonify({"error": "请提供查询内容"}), 400
+
+    query = data['query']
+    n_results = data.get('n_results', 3)
+
+    # 接收LLM返回的权重配置
+    weights_config = data.get('weights_config', None)
+    search_metadata = {}
+
+    # 解析权重配置
+    if weights_config:
+        try:
+            # 如果是字符串(JSON文本)，尝试解析成字典
+            if isinstance(weights_config, str):
+                weights_config = json.loads(weights_config)
+
+            vector_weight = float(weights_config.get('vector_weight', 0.7))
+            lexical_weight = float(weights_config.get('lexical_weight', 0.3))
+            query_type = weights_config.get('query_type', 'general')
+            reasoning = weights_config.get('reasoning', '')
+
+            # 记录使用的权重配置
+            search_metadata = {
+                "vector_weight": vector_weight,
+                "lexical_weight": lexical_weight,
+                "query_type": query_type,
+                "reasoning": reasoning,
+                "source": "llm_analysis"
+            }
+
+            app.logger.info(
+                f"使用LLM分析的查询权重: vector={vector_weight}, lexical={lexical_weight}, type={query_type}")
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            app.logger.error(f"解析权重配置时出错: {str(e)}")
+            # 使用默认值
+            vector_weight = None
+            lexical_weight = None
+            search_metadata = {"error": f"权重配置解析失败: {str(e)}"}
+    else:
+        # 未提供权重配置，使用系统默认值
+        vector_weight = None
+        lexical_weight = None
+        search_metadata = {"source": "default_weights"}
+
+    try:
+        # 确定是否使用混合搜索
+        use_hybrid_search = data.get('use_hybrid_search')
+        if use_hybrid_search is None:
+            use_hybrid_search = rag_system.use_hybrid_search and rag_system.es_client and rag_system.es_client.is_available
+
+        # 执行检索
+        if use_hybrid_search and rag_system.es_client and rag_system.es_client.is_available:
+            # 使用传入的权重配置调用混合搜索
+            search_results = rag_system.hybrid_search_all(
+                query=query,
+                n_results=n_results,
+                vector_weight=vector_weight,
+                lexical_weight=lexical_weight
+            )
+        else:
+            search_results = rag_system.search_vector(query, n_results)
+
+        # 格式化上下文
+        context = rag_system.format_context(search_results)
+
+        # 构建系统提示
+        system_prompt = """
+        你是一个专业的中文新闻与公告智能助手。请严格基于提供的上下文信息回答问题，不要添加任何未在上下文中明确提到的信息。
+        回答要求：
+        1. 简洁明了：保持回答简洁、结构清晰，重点突出
+        2. 信息归因：引用信息时指明来源（例如"根据XX新闻报道/XX公告通知..."）
+        3. 处理不确定性：如果上下文信息不足或存在矛盾，明确指出并说明限制
+        4. 时效性标注：提及日期和时间信息时，注明信息的时间背景
+        5. 区分处理：新闻内容以客观陈述为主，公告内容需强调其官方性和指导意义
+
+        当无法从上下文中找到相关信息时，请直接回答："根据现有信息，我无法回答这个问题。请问您是否想了解我们系统中的其他新闻或公告？"
+
+        对于复杂询问，先分析问题的核心需求，再从上下文提取相关信息，确保回答全面且准确。
+        """
+
+        # 构建用户提示
+        user_prompt = f"""用户问题: {query}
+
+        ----上下文信息----
+        {context}
+        ----上下文信息结束----
+
+        基于上述上下文信息，请回答用户的问题。如果上下文信息不足以回答用户问题，请明确指出。"""
+
+        # 返回提示词和上下文
+        return jsonify({
+            "success": True,
+            "query": query,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "context": context,
+            "search_results": search_results,
+            "search_type": "hybrid" if use_hybrid_search else "vector",
+            "search_metadata": search_metadata
+        })
+    except Exception as e:
+        app.logger.error(f"提取上下文和提示词时出错: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+# LLM上下文感知
+@app.route('/classify_query', methods=['POST'])
+def classify_query_endpoint():
+    """提供查询分类所需的提示词和内容"""
+    data = request.json
+    if not data or 'query' not in data:
+        return jsonify({"error": "请提供查询内容"}), 400
+
+    query = data['query']
+
+    # 构建系统提示词
+    system_prompt = """
+    你是一个专业的搜索查询分析器。你的任务是分析用户的查询意图，并确定在混合检索系统中使用的最佳权重。
+
+    请分析查询的语义和意图，然后确定它属于以下哪种类型：
+    1. 事实型查询：寻找具体事实、状态、数字或确切信息的查询
+    2. 时间型查询：与日期、时间、时间段相关的查询
+    3. 分类型查询：寻找特定类别、种类或分类体系的查询
+    4. 概念型查询：寻找解释、定义或概念性内容的查询
+    5. 通用型查询：不属于以上类别的一般性查询
+
+    对于不同类型的查询，应分配不同的检索权重：
+    - 事实型查询：词汇匹配(0.6)更重要，语义匹配(0.4)次之
+    - 时间型查询：词汇匹配(0.5)和语义匹配(0.5)同等重要
+    - 分类型查询：词汇匹配(0.6)更重要，语义匹配(0.4)次之
+    - 概念型查询：语义匹配(0.8)更重要，词汇匹配(0.2)次之
+    - 通用型查询：语义匹配(0.7)更重要，词汇匹配(0.3)次之
+
+    请分析查询并返回JSON格式的结果，包含以下字段：
+    - query_type: 查询类型(factual, temporal, categorical, conceptual, general)
+    - vector_weight: 语义匹配权重(0.0-1.0)
+    - lexical_weight: 词汇匹配权重(0.0-1.0)
+    - reasoning: 你的分析理由(简短说明)
+    """
+
+    # 构建用户提示词
+    user_prompt = f"""
+    请分析以下用户查询，确定查询类型并推荐合适的检索权重：
+
+    用户查询: "{query}"
+
+    请以JSON格式返回结果。只返回JSON对象，不要有其他说明文字。
+    """
+
+    # 返回提示词和查询
+    return jsonify({
+        "success": True,
+        "query": query,
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt
+    })
 
 # 启动函数
 if __name__ == "__main__":
