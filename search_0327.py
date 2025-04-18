@@ -931,44 +931,39 @@ class DocumentProcessor:
             return "OCR model not available", 0.0
 
         try:
-            # Convert bytes to PIL Image
-            img = Image.open(BytesIO(image_data))
-
-            # Convert to numpy array
+            # 先将字节数据打开为 PIL Image，并强制转为 RGB 三通道
+            img = Image.open(BytesIO(image_data)).convert("RGB")
             img_np = np.array(img)
 
-            # Run OCR
+            # 调用 OCR
             result = self.ocr.ocr(img_np, cls=True)
 
-            # Extract text and calculate average confidence
+            # 提取文字与置信度
             text_parts = []
             confidence_sum = 0.0
             count = 0
+            for line in result or []:
+                if isinstance(line, list) and line:
+                    # 取最后一个检测结果
+                    content, score = line[-1]
+                    confidence = float(score)
+                    if content and confidence > 0.5:
+                        text_parts.append(content)
+                        confidence_sum += confidence
+                        count += 1
 
-            if result:
-                for line in result:
-                    if isinstance(line, list) and line and len(line) > 0:
-                        if len(line[-1]) >= 2:
-                            text = line[-1][0]  # Text content
-                            confidence = float(line[-1][1])  # Confidence score
-
-                            if text and confidence > 0.5:  # Only include reasonably confident results
-                                text_parts.append(text)
-                                confidence_sum += confidence
-                                count += 1
-
-            # Calculate average confidence if there are valid detections
+            # 计算平均置信度
             avg_confidence = confidence_sum / count if count > 0 else 0.0
-            full_text = "\n".join(text_parts)
+            full_text = "\n".join(text_parts).strip()
 
-            if not full_text.strip():
+            if not full_text:
                 return "No text detected in image", 0.0
 
             return full_text, avg_confidence
 
         except Exception as e:
-            app.logger.error(f"Image processing error: {str(e)}")
-            return f"Failed to process image: {str(e)}", 0.0
+            app.logger.error(f"Image processing error: {e}")
+            return f"Failed to process image: {e}", 0.0
 
     def process_word_document(self, docx_data: bytes) -> str:
         """
