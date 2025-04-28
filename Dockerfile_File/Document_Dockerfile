@@ -1,0 +1,73 @@
+# 使用官方 Python 镜像作为基础镜像
+FROM python:3.10
+
+# 设置工作目录
+WORKDIR /app
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PADDLE_OCR_BASE_DIR=/root/.paddleocr/whl
+
+# 安装系统依赖
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    wget \
+    ghostscript \
+    poppler-utils \
+    libreoffice \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置 pip 使用阿里云的镜像源
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 创建OCR模型目录
+RUN mkdir -p $PADDLE_OCR_BASE_DIR/det/ch/ch_PP-OCRv3_det_infer && \
+    mkdir -p $PADDLE_OCR_BASE_DIR/rec/ch/ch_PP-OCRv3_rec_infer && \
+    mkdir -p $PADDLE_OCR_BASE_DIR/cls/ch_ppocr_mobile_v2.0_cls_infer
+
+# 安装核心依赖 - 分步骤安装以便于调试
+# 安装 PaddlePaddle 和 PaddleOCR 指定版本以及其他依赖
+RUN pip install paddlepaddle==2.5.2 -i https://pypi.tuna.tsinghua.edu.cn/simple
+RUN pip install PaddleOCR==2.6 requests numpy==1.26.4 pillow opencv-python-headless
+
+# 安装文档处理组件
+RUN pip install beautifulsoup4 PyPDF2 mammoth python-pptx PyMuPDF
+
+# 安装Web服务组件
+RUN pip install flask gunicorn
+
+# 下载并解压检测模型文件，确保文件直接位于目标目录
+RUN cd $PADDLE_OCR_BASE_DIR/det/ch/ch_PP-OCRv3_det_infer && \
+    wget https://paddleocr.bj.bcebos.com/PP-OCRv3/chinese/ch_PP-OCRv3_det_infer.tar && \
+    tar -xf ch_PP-OCRv3_det_infer.tar && \
+    mv ch_PP-OCRv3_det_infer/* . && \
+    rm -rf ch_PP-OCRv3_det_infer ch_PP-OCRv3_det_infer.tar
+
+# 下载并解压识别模型文件，确保文件直接位于目标目录
+RUN cd $PADDLE_OCR_BASE_DIR/rec/ch/ch_PP-OCRv3_rec_infer && \
+    wget https://paddleocr.bj.bcebos.com/PP-OCRv3/chinese/ch_PP-OCRv3_rec_infer.tar && \
+    tar -xf ch_PP-OCRv3_rec_infer.tar && \
+    mv ch_PP-OCRv3_rec_infer/* . && \
+    rm -rf ch_PP-OCRv3_rec_infer ch_PP-OCRv3_rec_infer.tar
+
+# 下载并解压分类模型文件，确保文件直接位于目标目录
+RUN cd $PADDLE_OCR_BASE_DIR/cls/ch_ppocr_mobile_v2.0_cls_infer && \
+    wget https://paddleocr.bj.bcebos.com/dygraph_v2.0/ch/ch_ppocr_mobile_v2.0_cls_infer.tar && \
+    tar -xf ch_ppocr_mobile_v2.0_cls_infer.tar && \
+    mv ch_ppocr_mobile_v2.0_cls_infer/* . && \
+    rm -rf ch_ppocr_mobile_v2.0_cls_infer ch_ppocr_mobile_v2.0_cls_infer.tar
+
+# 复制当前目录的所有文件到容器的 /app 目录
+COPY . /app
+
+# 暴露微服务端口
+EXPOSE 5002
+
+# 使用gunicorn作为WSGI服务器运行Flask应用
+# - 2个工作进程
+# - 绑定到所有接口的5002端口
+# - 设置超时时间为180秒（考虑到OCR和大文件处理可能需要更长时间）
+CMD ["gunicorn", "--workers=2", "--timeout=180", "--bind=0.0.0.0:5002", "app:app"]
