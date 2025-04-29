@@ -862,177 +862,230 @@ class AsyncTaskManager:
         # 实现清理逻辑...
         pass
 
-class DocumentProcessor:
-    """Document processing utilities for different file types"""
 
-    def __init__(self):
-        """Initialize document processor with OCR model"""
-        # Handle numpy compatibility issue
-        if not hasattr(np, 'int'):
-            np.int = np.int32
+class DocumentClient:
+    """文档处理客户端，用于与文档处理微服务通信"""
 
-        # Initialize OCR model
+    def __init__(self, base_url: str = "http://localhost:5002"):
+        """
+        初始化文档处理客户端
+
+        Args:
+            base_url: 文档处理微服务的基础URL
+        """
+        self.base_url = base_url.rstrip('/')
+        self.is_available = self._check_health()
+        self.session = requests.Session()
+        self.logger = logging.getLogger("DocumentClient")
+
+    def _check_health(self) -> bool:
+        """
+        检查文档处理服务是否可用
+
+        Returns:
+            bool: 服务是否可用
+        """
         try:
-            self.ocr = PaddleOCR(
-                det_model_dir="/root/.paddleocr/whl/det/ch/ch_PP-OCRv3_det_infer",
-                rec_model_dir="/root/.paddleocr/whl/rec/ch/ch_PP-OCRv3_rec_infer",
-                cls_model_dir="/root/.paddleocr/whl/cls/ch_ppocr_mobile_v2.0_cls_infer",
-                use_angle_cls=True,
-                lang="ch"
-            )
-            app.logger.info("OCR model initialized successfully")
+            response = requests.get(f"{self.base_url}/health", timeout=5)
+            return response.status_code == 200 and response.json().get("status") == "healthy"
         except Exception as e:
-            self.ocr = None
-            app.logger.error(f"Failed to initialize OCR model: {str(e)}")
+            self.logger.error(f"文档处理服务健康检查失败: {str(e)}")
+            return False
+
+    def process_image(self, image_url: str) -> Tuple[str, float]:
+        """
+        从图像URL中提取文本
+
+        Args:
+            image_url: 图像URL
+
+        Returns:
+            Tuple[str, float]: 提取的文本和置信度
+        """
+        if not self.is_available:
+            return "文档处理服务不可用", 0.0
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/process/image",
+                json={"url": image_url},
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("text", ""), result.get("metadata", {}).get("confidence", 0.0)
+            else:
+                self.logger.error(f"处理图像失败: {response.text}")
+                return f"处理图像失败: {response.text}", 0.0
+        except Exception as e:
+            self.logger.error(f"处理图像请求出错: {str(e)}")
+            return f"处理图像请求出错: {str(e)}", 0.0
+
+    def process_word_document(self, doc_url: str) -> str:
+        """
+        从Word文档URL中提取文本
+
+        Args:
+            doc_url: Word文档URL
+
+        Returns:
+            str: 提取的文本
+        """
+        if not self.is_available:
+            return "文档处理服务不可用"
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/process/word",
+                json={"url": doc_url},
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("text", "")
+            else:
+                self.logger.error(f"处理Word文档失败: {response.text}")
+                return f"处理Word文档失败: {response.text}"
+        except Exception as e:
+            self.logger.error(f"处理Word文档请求出错: {str(e)}")
+            return f"处理Word文档请求出错: {str(e)}"
+
+    def process_pdf(self, pdf_url: str) -> str:
+        """
+        从PDF URL中提取文本
+
+        Args:
+            pdf_url: PDF URL
+
+        Returns:
+            str: 提取的文本
+        """
+        if not self.is_available:
+            return "文档处理服务不可用"
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/process/pdf",
+                json={"url": pdf_url},
+                timeout=60  # PDF处理可能需要更长时间
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("text", "")
+            else:
+                self.logger.error(f"处理PDF失败: {response.text}")
+                return f"处理PDF失败: {response.text}"
+        except Exception as e:
+            self.logger.error(f"处理PDF请求出错: {str(e)}")
+            return f"处理PDF请求出错: {str(e)}"
+
+    def process_ppt(self, ppt_url: str) -> str:
+        """
+        从PPT URL中提取文本
+
+        Args:
+            ppt_url: PPT URL
+
+        Returns:
+            str: 提取的文本
+        """
+        if not self.is_available:
+            return "文档处理服务不可用"
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/process/ppt",
+                json={"url": ppt_url},
+                timeout=60  # PPT处理可能需要更长时间
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("text", "")
+            else:
+                self.logger.error(f"处理PPT失败: {response.text}")
+                return f"处理PPT失败: {response.text}"
+        except Exception as e:
+            self.logger.error(f"处理PPT请求出错: {str(e)}")
+            return f"处理PPT请求出错: {str(e)}"
 
     def sanitize_html(self, html_content: str) -> str:
         """
-        Sanitize HTML content to extract clean text
+        清理HTML内容
 
         Args:
-            html_content: HTML string to sanitize
+            html_content: HTML内容
 
         Returns:
-            str: Clean text extracted from HTML
+            str: 清理后的文本
+        """
+        if not self.is_available:
+            # 如果服务不可用，使用本地备用方法
+            try:
+                soup = BeautifulSoup(html_content, 'html.parser')
+                for script in soup(["script", "style"]):
+                    script.extract()
+                text = soup.get_text(separator=' ', strip=True)
+                lines = (line.strip() for line in text.splitlines())
+                chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                return '\n'.join(chunk for chunk in chunks if chunk)
+            except Exception as e:
+                self.logger.error(f"本地HTML清理错误: {str(e)}")
+                return html_content
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/process/html",
+                json={"html": html_content},
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("text", "")
+            else:
+                self.logger.error(f"处理HTML失败: {response.text}")
+                # 回退到本地处理
+                return self.sanitize_html_local(html_content)
+        except Exception as e:
+            self.logger.error(f"处理HTML请求出错: {str(e)}")
+            # 回退到本地处理
+            return self.sanitize_html_local(html_content)
+
+    def sanitize_html_local(self, html_content: str) -> str:
+        """
+        本地备用的HTML清理方法，当服务不可用时使用
+
+        Args:
+            html_content: HTML内容
+
+        Returns:
+            str: 清理后的文本
         """
         try:
             soup = BeautifulSoup(html_content, 'html.parser')
 
-            # Remove script and style elements
+            # 移除脚本和样式元素
             for script in soup(["script", "style"]):
                 script.extract()
 
-            # Get text
+            # 获取文本
             text = soup.get_text(separator=' ', strip=True)
 
-            # Clean up whitespace
+            # 清理空白区域
             lines = (line.strip() for line in text.splitlines())
             chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
             text = '\n'.join(chunk for chunk in chunks if chunk)
 
             return text
         except Exception as e:
-            app.logger.error(f"HTML sanitization error: {str(e)}")
-            # Return the original content if sanitization fails
+            self.logger.error(f"本地HTML清理错误: {str(e)}")
+            # 如果清理失败，返回原始内容
             return html_content
 
-    def process_image(self, image_data: bytes) -> Tuple[str, float]:
-        """
-        Extract text from image using OCR
-
-        Args:
-            image_data: Binary image data
-
-        Returns:
-            Tuple[str, float]: Extracted text and average confidence score
-        """
-        if self.ocr is None:
-            app.logger.error("OCR model not initialized")
-            return "OCR model not available", 0.0
-
-        try:
-            # 先将字节数据打开为 PIL Image，并强制转为 RGB 三通道
-            img = Image.open(BytesIO(image_data)).convert("RGB")
-            img_np = np.array(img)
-
-            # 调用 OCR
-            result = self.ocr.ocr(img_np, cls=True)
-
-            # 提取文字与置信度
-            text_parts = []
-            confidence_sum = 0.0
-            count = 0
-            for line in result or []:
-                if isinstance(line, list) and line:
-                    # 取最后一个检测结果
-                    content, score = line[-1]
-                    confidence = float(score)
-                    if content and confidence > 0.5:
-                        text_parts.append(content)
-                        confidence_sum += confidence
-                        count += 1
-
-            # 计算平均置信度
-            avg_confidence = confidence_sum / count if count > 0 else 0.0
-            full_text = "\n".join(text_parts).strip()
-
-            if not full_text:
-                return "No text detected in image", 0.0
-
-            return full_text, avg_confidence
-
-        except Exception as e:
-            app.logger.error(f"Image processing error: {e}")
-            return f"Failed to process image: {e}", 0.0
-
-    def process_word_document(self, docx_data: bytes) -> str:
-        """
-        Extract text from Word document
-
-        Args:
-            docx_data: Binary Word document data
-
-        Returns:
-            str: Extracted text
-        """
-        try:
-            result = mammoth.extract_raw_text(BytesIO(docx_data))
-            return result.value
-        except Exception as e:
-            app.logger.error(f"Word document processing error: {str(e)}")
-            return f"Failed to process Word document: {str(e)}"
-
-    def process_pdf(self, pdf_data: bytes) -> str:
-        """
-        Extract text from PDF document
-
-        Args:
-            pdf_data: Binary PDF data
-
-        Returns:
-            str: Extracted text
-        """
-        try:
-            with BytesIO(pdf_data) as pdf_file:
-                pdf_reader = PyPDF2.PdfReader(pdf_file)
-                text = []
-
-                for page_num in range(len(pdf_reader.pages)):
-                    page = pdf_reader.pages[page_num]
-                    text.append(page.extract_text())
-
-            return "\n\n".join(text)
-        except Exception as e:
-            app.logger.error(f"PDF processing error: {str(e)}")
-            return f"Failed to process PDF: {str(e)}"
-
-    def get_file_content(self, file_data: bytes, file_type: str) -> str:
-        """
-        Process file based on its type and return text content
-
-        Args:
-            file_data: Binary file data
-            file_type: MIME type or file extension
-
-        Returns:
-            str: Extracted text content
-        """
-        file_type = file_type.lower()
-
-        if file_type in ['image/jpeg', 'image/png', 'image/jpg', 'image/gif', 'image/bmp']:
-            text, confidence = self.process_image(file_data)
-            return text
-        elif file_type in ['application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                           'application/msword', '.docx', '.doc']:
-            return self.process_word_document(file_data)
-        elif file_type in ['application/pdf', '.pdf']:
-            return self.process_pdf(file_data)
-        elif file_type in ['text/html', '.html', '.htm']:
-            return self.sanitize_html(file_data.decode('utf-8', errors='replace'))
-        elif file_type in ['text/plain', '.txt']:
-            return file_data.decode('utf-8', errors='replace')
-        else:
-            return f"Unsupported file type: {file_type}"
 
 class ChineseRAGSystem:
     def __init__(
@@ -1045,7 +1098,8 @@ class ChineseRAGSystem:
             chunk_overlap: int = 200,
             use_hybrid_search: bool = False,
             es_service_url: str = "http://localhost:8085",
-            vector_service_url: str = "http://localhost:5001"
+            vector_service_url: str = "http://localhost:5001",
+            document_service_url: str = "http://localhost:5002"
     ):
         """
         初始化中文RAG系统
@@ -1066,8 +1120,10 @@ class ChineseRAGSystem:
         self.use_hybrid_search = use_hybrid_search
         self.es_service_url = es_service_url
 
-        # 初始化文档处理器
-        self.doc_processor = DocumentProcessor()
+        # 初始化文档处理客户端
+        self.document_service_url = document_service_url
+        self.doc_client = DocumentClient(base_url=document_service_url)
+        app.logger.info(f"文档处理客户端初始化完成，服务可用: {self.doc_client.is_available}")
 
         # 是否使用LangChain
         self.use_langchain = use_langchain
@@ -1353,45 +1409,43 @@ class ChineseRAGSystem:
                 processed_content = original_content
 
                 # 检查content是否包含HTML内容
+                # 检查content是否包含HTML内容
                 if '<' in original_content and '>' in original_content:
                     try:
-                        # 使用BeautifulSoup解析HTML内容
-                        soup = BeautifulSoup(original_content, 'html.parser')
-
-                        # 获取纯文本内容
-                        text_content = self.doc_processor.sanitize_html(original_content)
+                        # 使用文档处理服务清理HTML
+                        text_content = self.doc_client.sanitize_html(original_content)
 
                         # 处理嵌入的图片
                         embedded_contents = []
+                        soup = BeautifulSoup(original_content, 'html.parser')
                         for img in soup.find_all('img'):
                             src = img.get('src', '')
                             if src and (src.startswith('http://') or src.startswith('https://')):
                                 try:
-                                    # 下载图片
-                                    img_response = requests.get(src, timeout=10)
-                                    if img_response.status_code == 200:
-                                        # 处理图片中的文本
-                                        img_text, confidence = self.doc_processor.process_image(img_response.content)
-                                        if img_text and img_text != "No text detected in image":
-                                            embedded_contents.append(f"【图片内容】: {img_text}")
+                                    # 使用文档处理服务处理图片
+                                    img_text, confidence = self.doc_client.process_image(src)
+                                    if img_text and img_text != "No text detected in image" and img_text != "图像中未检测到文本":
+                                        embedded_contents.append(f"【图片内容】: {img_text}")
                                 except Exception as e:
                                     app.logger.warning(f"处理嵌入图片时出错: {str(e)}")
 
                         # 处理嵌入的文档链接
                         for a in soup.find_all('a'):
                             href = a.get('href', '')
-                            if href and (href.endswith('.pdf') or href.endswith('.docx') or href.endswith('.doc')):
+                            if href:
                                 try:
-                                    # 下载文档
-                                    doc_response = requests.get(href, timeout=20)
-                                    if doc_response.status_code == 200:
-                                        # 根据文件类型处理文档
-                                        if href.endswith('.pdf'):
-                                            doc_text = self.doc_processor.process_pdf(doc_response.content)
-                                            embedded_contents.append(f"【PDF文档内容】: {doc_text}")
-                                        elif href.endswith('.docx') or href.endswith('.doc'):
-                                            doc_text = self.doc_processor.process_word_document(doc_response.content)
-                                            embedded_contents.append(f"【Word文档内容】: {doc_text}")
+                                    if href.endswith('.pdf'):
+                                        # 使用文档处理服务处理PDF
+                                        doc_text = self.doc_client.process_pdf(href)
+                                        embedded_contents.append(f"【PDF文档内容】: {doc_text}")
+                                    elif href.endswith('.docx') or href.endswith('.doc'):
+                                        # 使用文档处理服务处理Word
+                                        doc_text = self.doc_client.process_word_document(href)
+                                        embedded_contents.append(f"【Word文档内容】: {doc_text}")
+                                    elif href.endswith('.pptx') or href.endswith('.ppt'):
+                                        # 使用文档处理服务处理PPT
+                                        doc_text = self.doc_client.process_ppt(href)
+                                        embedded_contents.append(f"【PPT文档内容】: {doc_text}")
                                 except Exception as e:
                                     app.logger.warning(f"处理嵌入文档时出错: {str(e)}")
 
@@ -1405,7 +1459,7 @@ class ChineseRAGSystem:
                     except Exception as e:
                         app.logger.error(f"处理HTML内容时出错: {str(e)}")
                         # 失败时至少清理HTML标签
-                        processed_content = self.doc_processor.sanitize_html(original_content)
+                        processed_content = self.doc_client.sanitize_html(original_content)
 
                 # 1. 向量服务：发送到向量服务
                 if self.vector_client and self.vector_client.is_available:
@@ -1500,43 +1554,40 @@ class ChineseRAGSystem:
                 # 检查content是否包含HTML内容
                 if '<' in original_content and '>' in original_content:
                     try:
-                        # 使用BeautifulSoup解析HTML内容
-                        soup = BeautifulSoup(original_content, 'html.parser')
-
-                        # 获取纯文本内容
-                        text_content = self.doc_processor.sanitize_html(original_content)
+                        # 使用文档处理服务清理HTML
+                        text_content = self.doc_client.sanitize_html(original_content)
 
                         # 处理嵌入的图片
                         embedded_contents = []
+                        soup = BeautifulSoup(original_content, 'html.parser')
                         for img in soup.find_all('img'):
                             src = img.get('src', '')
                             if src and (src.startswith('http://') or src.startswith('https://')):
                                 try:
-                                    # 下载图片
-                                    img_response = requests.get(src, timeout=10)
-                                    if img_response.status_code == 200:
-                                        # 处理图片中的文本
-                                        img_text, confidence = self.doc_processor.process_image(img_response.content)
-                                        if img_text and img_text != "No text detected in image":
-                                            embedded_contents.append(f"【图片内容】: {img_text}")
+                                    # 使用文档处理服务处理图片
+                                    img_text, confidence = self.doc_client.process_image(src)
+                                    if img_text and img_text != "No text detected in image" and img_text != "图像中未检测到文本":
+                                        embedded_contents.append(f"【图片内容】: {img_text}")
                                 except Exception as e:
                                     app.logger.warning(f"处理嵌入图片时出错: {str(e)}")
 
                         # 处理嵌入的文档链接
                         for a in soup.find_all('a'):
                             href = a.get('href', '')
-                            if href and (href.endswith('.pdf') or href.endswith('.docx') or href.endswith('.doc')):
+                            if href:
                                 try:
-                                    # 下载文档
-                                    doc_response = requests.get(href, timeout=20)
-                                    if doc_response.status_code == 200:
-                                        # 根据文件类型处理文档
-                                        if href.endswith('.pdf'):
-                                            doc_text = self.doc_processor.process_pdf(doc_response.content)
-                                            embedded_contents.append(f"【PDF文档内容】: {doc_text}")
-                                        elif href.endswith('.docx') or href.endswith('.doc'):
-                                            doc_text = self.doc_processor.process_word_document(doc_response.content)
-                                            embedded_contents.append(f"【Word文档内容】: {doc_text}")
+                                    if href.endswith('.pdf'):
+                                        # 使用文档处理服务处理PDF
+                                        doc_text = self.doc_client.process_pdf(href)
+                                        embedded_contents.append(f"【PDF文档内容】: {doc_text}")
+                                    elif href.endswith('.docx') or href.endswith('.doc'):
+                                        # 使用文档处理服务处理Word
+                                        doc_text = self.doc_client.process_word_document(href)
+                                        embedded_contents.append(f"【Word文档内容】: {doc_text}")
+                                    elif href.endswith('.pptx') or href.endswith('.ppt'):
+                                        # 使用文档处理服务处理PPT
+                                        doc_text = self.doc_client.process_ppt(href)
+                                        embedded_contents.append(f"【PPT文档内容】: {doc_text}")
                                 except Exception as e:
                                     app.logger.warning(f"处理嵌入文档时出错: {str(e)}")
 
@@ -1550,7 +1601,7 @@ class ChineseRAGSystem:
                     except Exception as e:
                         app.logger.error(f"处理HTML内容时出错: {str(e)}")
                         # 失败时至少清理HTML标签
-                        processed_content = self.doc_processor.sanitize_html(original_content)
+                        processed_content = self.doc_client.sanitize_html(original_content)
 
                 # 1. 向量服务：发送到向量服务
                 if self.vector_client and self.vector_client.is_available:
@@ -1713,6 +1764,7 @@ CHUNK_OVERLAP = int(os.environ.get('CHUNK_OVERLAP', '200'))
 USE_HYBRID_SEARCH = os.environ.get('use_hybrid_search', 'true').lower() == 'true'
 ES_SERVICE_URL = os.environ.get('es_service_url', 'http://192.168.140.100:8085')
 RERANK_SERVICE_URL = os.environ.get('rerank_service_url', 'http://192.168.140.100:8091')
+DOCUMENT_SERVICE_URL = os.environ.get('document_service_url', 'http://localhost:5002')  # 新增
 
 if CHROMA_PORT and CHROMA_PORT.isdigit():
     CHROMA_PORT = int(CHROMA_PORT)
@@ -1735,7 +1787,8 @@ with app.app_context():
             chunk_overlap=CHUNK_OVERLAP,
             use_hybrid_search=USE_HYBRID_SEARCH,
             es_service_url=ES_SERVICE_URL if USE_HYBRID_SEARCH else None,
-            vector_service_url=VECTOR_SERVICE_URL
+            vector_service_url=VECTOR_SERVICE_URL,
+            document_service_url=DOCUMENT_SERVICE_URL  # 添加文档服务URL
         )
 
         app.logger.info("RAG系统初始化完成")
@@ -1943,6 +1996,7 @@ def delete_announcement_endpoint(doc_id):
         app.logger.error(f"删除公告时出错: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/process/file', methods=['POST'])
 def process_file_endpoint():
     """处理文件提取内容接口"""
@@ -1957,22 +2011,62 @@ def process_file_endpoint():
         return jsonify({"error": "未选择文件"}), 400
 
     try:
-        file_data = file.read()
+        # 保存文件到临时目录
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp:
+            file.save(temp.name)
+            temp_path = temp.name
+
+        # 构建URL
         file_type = file.content_type or os.path.splitext(file.filename)[1]
 
-        extracted_content = rag_system.doc_processor.get_file_content(file_data, file_type)
+        # 使用本地文件系统路径 - 在实际环境中应替换为可访问的URL
+        # 这里假设我们在同一环境中，可以共享文件路径
+        # 实际应用中可能需要上传到对象存储并获取URL
 
-        return jsonify({
-            "success": True,
-            "filename": file.filename,
-            "file_type": file_type,
-            "content": extracted_content,
-            "content_length": len(extracted_content)
-        })
+        if file_type.startswith('image/') or file_type.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
+            result_json = requests.post(
+                f"{rag_system.document_service_url}/process/image",
+                json={"url": temp_path},  # 这里需要实际系统支持
+                timeout=30
+            ).json()
+        elif file_type.startswith('application/pdf') or file_type.endswith('.pdf'):
+            result_json = requests.post(
+                f"{rag_system.document_service_url}/process/pdf",
+                json={"url": temp_path},
+                timeout=60
+            ).json()
+        elif (file_type.startswith('application/vnd.openxmlformats-officedocument.wordprocessingml.document') or
+              file_type.startswith('application/msword') or
+              file_type.endswith(('.doc', '.docx'))):
+            result_json = requests.post(
+                f"{rag_system.document_service_url}/process/word",
+                json={"url": temp_path},
+                timeout=30
+            ).json()
+        elif (file_type.startswith('application/vnd.openxmlformats-officedocument.presentationml.presentation') or
+              file_type.startswith('application/vnd.ms-powerpoint') or
+              file_type.endswith(('.ppt', '.pptx'))):
+            result_json = requests.post(
+                f"{rag_system.document_service_url}/process/ppt",
+                json={"url": temp_path},
+                timeout=60
+            ).json()
+        else:
+            # 对于不支持的文件类型，返回错误
+            os.unlink(temp_path)  # 清理临时文件
+            return jsonify({"error": f"不支持的文件类型: {file_type}"}), 400
+
+        # 清理临时文件
+        os.unlink(temp_path)
+
+        # 添加文件信息
+        result_json["metadata"]["filename"] = file.filename
+        result_json["metadata"]["original_file_type"] = file_type
+
+        return jsonify(result_json)
     except Exception as e:
         app.logger.error(f"处理文件时出错: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
 
 @app.route('/process/html', methods=['POST'])
 def process_html_endpoint():
@@ -1986,7 +2080,7 @@ def process_html_endpoint():
 
     try:
         html_content = data['html']
-        sanitized_content = rag_system.doc_processor.sanitize_html(html_content)
+        sanitized_content = rag_system.doc_client.sanitize_html(html_content)
 
         return jsonify({
             "success": True,
